@@ -89,5 +89,36 @@ class TestSanityChecks(unittest.TestCase):
         self.assertFalse(valid)
         self.assertIn("skinlessPrice is null", err)
 
+    def test_extract_published_date(self):
+        from scrape_rates import extract_published_date_from_html
+        from datetime import date
+
+        html_sample = "<div><h2>Today Chicken Rate Hyderabad</h2><p>Date: 25-09-2026</p></div>"
+        pub_date, _ = extract_published_date_from_html(html_sample)
+        self.assertEqual(pub_date, date(2026, 9, 25))
+
+    def test_date_verification_aborts_on_yesterday_rates(self):
+        from scrape_rates import verify_market_date_against_ist
+        from datetime import date
+
+        today_ist = date(2026, 9, 26)
+        yesterday_ist = date(2026, 9, 25)
+
+        # Website still displaying yesterday's rates
+        stale_dates = {
+            "PoultryBazaar (Hyderabad)": yesterday_ist
+        }
+        is_verified, err = verify_market_date_against_ist(stale_dates, today_ist)
+        self.assertFalse(is_verified)
+        self.assertIn("Waiting for market update", err)
+
+        # Website updated with today's rates
+        today_dates = {
+            "PoultryBazaar (Hyderabad)": today_ist
+        }
+        is_verified, err = verify_market_date_against_ist(today_dates, today_ist)
+        self.assertTrue(is_verified)
+        self.assertIsNone(err)
+
 if __name__ == "__main__":
     unittest.main()
