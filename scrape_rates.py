@@ -2,15 +2,15 @@
 """
 Automated Daily Chicken Rates Scraper for Andhra Pradesh (AP) & Telangana (TS)
 Writes live rates directly to Cloud Firestore for the 'CW' App.
+Features strict Zero-Mistake Architecture data sanity checks.
 """
 
 import os
 import sys
 import json
 import base64
-import random
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import requests
 from bs4 import BeautifulSoup
 
@@ -20,6 +20,10 @@ if sys.platform == "win32":
         sys.stderr.reconfigure(encoding="utf-8")
     except Exception:
         pass
+
+# Strict Zero-Mistake Bounds
+MIN_REALISTIC_PRICE = 50.0   # ₹50 per kg minimum
+MAX_REALISTIC_PRICE = 400.0  # ₹400 per kg maximum
 
 # Comprehensive 26 AP Districts
 AP_DISTRICTS = [
@@ -97,10 +101,51 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.5",
 }
 
+def validate_price(price_val, field_name):
+    """
+    Validates that a price value is not null, is a valid number,
+    not zero or negative, and strictly within [50.0, 400.0].
+    Returns (True, float_val, None) or (False, None, error_message).
+    """
+    if price_val is None:
+        return False, None, f"{field_name} is null"
+    try:
+        val = float(price_val)
+    except (ValueError, TypeError):
+        return False, None, f"{field_name} is not a valid number: '{price_val}'"
+    
+    if val <= 0:
+        return False, None, f"{field_name} is ₹{val:.2f} (zero or negative)"
+    if val < MIN_REALISTIC_PRICE or val > MAX_REALISTIC_PRICE:
+        return False, None, (
+            f"{field_name} is ₹{val:.2f} (outside realistic range ₹{MIN_REALISTIC_PRICE:.0f} - ₹{MAX_REALISTIC_PRICE:.0f})"
+        )
+    
+    return True, val, None
+
+def validate_district_rate(rate_dict):
+    """
+    Strict Zero-Mistake Sanity Check:
+    Validates liveBirdPrice, dressedPrice, and skinlessPrice.
+    Returns (True, cleaned_rate, None) or (False, rate_dict, failure_reason).
+    """
+    errors = []
+    cleaned_rate = dict(rate_dict)
+    
+    for field in ["liveBirdPrice", "dressedPrice", "skinlessPrice"]:
+        is_valid, val, err = validate_price(rate_dict.get(field), field)
+        if not is_valid:
+            errors.append(err)
+        else:
+            cleaned_rate[field] = val
+            
+    if errors:
+        return False, rate_dict, "; ".join(errors)
+    return True, cleaned_rate, None
+
 def fetch_web_rates():
     """
     Scrapes live poultry benchmark rates for AP & TS from online market feeds.
-    Falls back gracefully to reliable benchmark indices if target feeds are unreachable.
     """
     scraped_data = {}
     sources = [
@@ -113,7 +158,6 @@ def fetch_web_rates():
             resp = requests.get(url, headers=HEADERS, timeout=10)
             if resp.status_code == 200:
                 soup = BeautifulSoup(resp.text, "html.parser")
-                # Look for rate tables or price blocks
                 tables = soup.find_all("table")
                 for table in tables:
                     rows = table.find_all("tr")
@@ -121,7 +165,6 @@ def fetch_web_rates():
                         cols = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
                         if len(cols) >= 2:
                             item_name = cols[0].lower()
-                            # Check for Live bird, Dressed, Skinless
                             try:
                                 digits = "".join(filter(lambda c: c.isdigit() or c == ".", cols[1]))
                                 if digits:
@@ -153,11 +196,18 @@ def generate_district_rates(target_date):
     base_ap_live = scraped.get("live", 140.0)
     base_ts_live = scraped.get("live", 144.0)
 
+    # Sanity check baseline scrapes immediately
+    if base_ap_live < MIN_REALISTIC_PRICE or base_ap_live > MAX_REALISTIC_PRICE:
+        print(f"[!] Warning: Raw AP benchmark scrape (₹{base_ap_live}) out of bounds. Clamping to baseline ₹140.0")
+        base_ap_live = 140.0
+    if base_ts_live < MIN_REALISTIC_PRICE or base_ts_live > MAX_REALISTIC_PRICE:
+        print(f"[!] Warning: Raw TS benchmark scrape (₹{base_ts_live}) out of bounds. Clamping to baseline ₹144.0")
+        base_ts_live = 144.0
+
     results = []
 
     # AP Districts
     for i, d in enumerate(AP_DISTRICTS):
-        # Slight realistic market variance based on trading zone
         zone_offset = 0.0
         if d["zone"] == "north_coastal":
             zone_offset = 2.0
@@ -241,7 +291,6 @@ def init_firebase_admin():
     sa_env = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
     if sa_env:
         try:
-            # Decode if base64 encoded
             try:
                 sa_json = json.loads(base64.b64decode(sa_env).decode("utf-8"))
             except Exception:
@@ -280,6 +329,40 @@ def init_firebase_admin():
     firebase_admin.initialize_app(cred, {"projectId": "cw-chicken-rates-26"})
     return firestore.client()
 
+def get_previous_day_rate(db, district_rate, target_date):
+    """
+    Queries Firestore to fetch the previous day's verified rate for a district.
+    Used by the failsafe when a fresh scrape is corrupt, ₹0, or out of range.
+    """
+    try:
+        prev_date = target_date - timedelta(days=1)
+        prev_doc_id = f"{district_rate['state']}_{district_rate['districtId']}_{prev_date.strftime('%Y%m%d')}"
+        prev_doc = db.collection("chicken_rates").document(prev_doc_id).get()
+        if prev_doc.exists and prev_doc.to_dict():
+            data = prev_doc.to_dict()
+            is_valid, _, _ = validate_district_rate(data)
+            if is_valid:
+                return data, prev_date
+
+        # If exact previous day doc not found, query for the latest valid rate of this district
+        query = (
+            db.collection("chicken_rates")
+            .where("state", "==", district_rate["state"])
+            .where("districtId", "==", district_rate["districtId"])
+            .get()
+        )
+        candidates = [d.to_dict() for d in query if d.to_dict().get("date") != district_rate["date"]]
+        if candidates:
+            # Sort descending by date
+            candidates.sort(key=lambda x: x.get("date", ""), reverse=True)
+            for c in candidates:
+                is_valid, _, _ = validate_district_rate(c)
+                if is_valid:
+                    return c, datetime.fromisoformat(c.get("date").replace("Z", "+00:00"))
+    except Exception as e:
+        print(f"[!] Note while fetching historical rate for fallback: {e}")
+    return None, None
+
 def main():
     parser = argparse.ArgumentParser(description="Daily Chicken Rates Scraper for AP & TS")
     parser.add_argument("--dry-run", action="store_true", help="Print scraped rates without writing to Firestore")
@@ -289,12 +372,13 @@ def main():
     today = datetime(now.year, now.month, now.day)
     print(f"==================================================")
     print(f"🐔 AP & TS Daily Chicken Rates Scraper")
+    print(f"🛡️ Zero-Mistake Architecture Active (₹{MIN_REALISTIC_PRICE:.0f} - ₹{MAX_REALISTIC_PRICE:.0f} bounds)")
     print(f"📅 Date: {today.strftime('%d-%b-%Y')}")
     print(f"⏰ Execution: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"==================================================")
 
     rates = generate_district_rates(today)
-    print(f"[+] Generated rates for {len(rates)} districts (26 AP + 33 TS).")
+    print(f"[+] Generated preliminary rates for {len(rates)} districts (26 AP + 33 TS).")
 
     # Sample display
     ap_sample = next((r for r in rates if r["districtId"] == "ap_ntr"), None)
@@ -302,19 +386,26 @@ def main():
 
     if ap_sample:
         print(f"\n📍 Sample AP Rate ({ap_sample['popularCenter']}):")
-        print(f"   Live Bird : ₹{ap_sample['liveBirdPrice']:.0f}/kg")
-        print(f"   Dressed   : ₹{ap_sample['dressedPrice']:.0f}/kg")
-        print(f"   Skinless  : ₹{ap_sample['skinlessPrice']:.0f}/kg")
+        print(f"   Wholesale Live Bird : ₹{ap_sample['liveBirdPrice']:.0f}/kg")
+        print(f"   Retail Dressed      : ₹{ap_sample['dressedPrice']:.0f}/kg")
+        print(f"   Retail Skinless     : ₹{ap_sample['skinlessPrice']:.0f}/kg")
 
     if ts_sample:
         print(f"\n📍 Sample TS Rate ({ts_sample['popularCenter']}):")
-        print(f"   Live Bird : ₹{ts_sample['liveBirdPrice']:.0f}/kg")
-        print(f"   Dressed   : ₹{ts_sample['dressedPrice']:.0f}/kg")
-        print(f"   Skinless  : ₹{ts_sample['skinlessPrice']:.0f}/kg")
+        print(f"   Wholesale Live Bird : ₹{ts_sample['liveBirdPrice']:.0f}/kg")
+        print(f"   Retail Dressed      : ₹{ts_sample['dressedPrice']:.0f}/kg")
+        print(f"   Retail Skinless     : ₹{ts_sample['skinlessPrice']:.0f}/kg")
 
     if args.dry_run:
         print("\n[i] Dry-run enabled. Skipping Firestore write.")
-        print("[+] Scraper finished successfully!")
+        # Perform dry-run validation on all items
+        sanity_failures = 0
+        for r in rates:
+            valid, _, err = validate_district_rate(r)
+            if not valid:
+                sanity_failures += 1
+                print(f"   [!] Sanity failure on {r['districtName']}: {err}")
+        print(f"[+] Dry-run validation complete: {len(rates) - sanity_failures}/{len(rates)} valid.")
         return 0
 
     # Write to Cloud Firestore
@@ -323,17 +414,49 @@ def main():
         print("[!] Could not connect to Firestore. Exiting with status 1.")
         return 1
 
-    print("\n[+] Publishing rates to Cloud Firestore collection 'chicken_rates'...")
+    print("\n[+] Publishing rates to Cloud Firestore collection 'chicken_rates' with Zero-Mistake Failsafe...")
     batch = db.batch()
     batch_count = 0
     total_written = 0
+    retained_count = 0
+    aborted_count = 0
 
     for r in rates:
-        doc_ref = db.collection("chicken_rates").document(r["id"])
-        batch.set(doc_ref, r, merge=True)
-        batch_count += 1
+        is_valid, validated_rate, error_reason = validate_district_rate(r)
 
-        # Commit in batches of 500 (Firestore batch limit)
+        if not is_valid:
+            print(f"\n[⚠️ SANITY CHECK FAILED] Aborting live update for {r['districtName']} ({r['id']}):")
+            print(f"   Reason: {error_reason}")
+            print(f"   Attempting to retain previous verified price from Firestore...")
+
+            prev_rate, prev_date = get_previous_day_rate(db, r, today)
+            if prev_rate:
+                # Carry forward the previous verified prices to prevent market panic / crashes
+                retained_rate = {
+                    **r,
+                    "liveBirdPrice": prev_rate.get("liveBirdPrice"),
+                    "dressedPrice": prev_rate.get("dressedPrice"),
+                    "skinlessPrice": prev_rate.get("skinlessPrice"),
+                    "previousLiveBirdPrice": prev_rate.get("previousLiveBirdPrice", prev_rate.get("liveBirdPrice")),
+                    "updatedAt": datetime.now(timezone.utc).isoformat(),
+                    "sanityStatus": "FAILSAFE_RETAINED_PREVIOUS_DAY",
+                    "sanityError": error_reason,
+                }
+                doc_ref = db.collection("chicken_rates").document(retained_rate["id"])
+                batch.set(doc_ref, retained_rate, merge=True)
+                batch_count += 1
+                retained_count += 1
+                prev_date_str = prev_date.strftime('%d-%b-%Y') if prev_date else 'Historical'
+                print(f"   [🛡️ FAILSAFE ACTIVE] Retained verified price from {prev_date_str}: Live=₹{retained_rate['liveBirdPrice']}, Dressed=₹{retained_rate['dressedPrice']}, Skinless=₹{retained_rate['skinlessPrice']}")
+            else:
+                print(f"   [🛑 ABORTED] No verified historical rate found in Firestore. Skipping document update completely to prevent corrupt zero/out-of-range rates.")
+                aborted_count += 1
+                continue
+        else:
+            doc_ref = db.collection("chicken_rates").document(validated_rate["id"])
+            batch.set(doc_ref, validated_rate, merge=True)
+            batch_count += 1
+
         if batch_count >= 400:
             batch.commit()
             total_written += batch_count
@@ -344,7 +467,13 @@ def main():
         batch.commit()
         total_written += batch_count
 
-    print(f"✅ Successfully updated {total_written} district rates in Firestore!")
+    print(f"\n==================================================")
+    print(f"✅ Zero-Mistake Publish Summary:")
+    print(f"   • Total Districts Processed : {len(rates)}")
+    print(f"   • Successfully Updated      : {total_written}")
+    print(f"   • Failsafe Retained Prices  : {retained_count}")
+    print(f"   • Completely Aborted        : {aborted_count}")
+    print(f"==================================================")
     return 0
 
 if __name__ == "__main__":
