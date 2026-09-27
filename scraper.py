@@ -4,17 +4,18 @@ Official Vencobb & BICC Daily Chicken Rates Scraper for Andhra Pradesh (AP) & Te
 Writes authoritative poultry market rates and trend indicators directly to Cloud Firestore.
 
 Features:
-1. Target Official Sources: Scrapes daily rate sheets from authoritative portals (poultrybazaar.net,
-   chickenratetoday.in, and benchmark feeds) publishing Vencobb and BICC paper rates.
-2. Strict Date Verification: Verifies that the published date on the BICC/Vencobb sources matches
-   today's date in IST (UTC+5:30). If the website still shows yesterday's date, aborts the push
-   and logs 'Waiting for market update' error to prevent database overwrites with stale data.
-3. Exact Column & Row Mapping: Maps exact table columns (Vencobb Paper Rate, Mandi Rate) and rows
-   for 'Hyderabad' and all AP/TS districts, saving it to Firestore as `wholesale_live_bird`.
+1. Correct Live URLs: Targets active endpoints:
+   - Hyderabad / Telangana: https://chickenratetoday.in/today-chicken-rate-hyderabad/
+   - Andhra Pradesh: https://chickenratetoday.in/today-chicken-rate-andhra-pradesh/
+   (All broken endpoints including poultrysite.in and root chickenratetoday.in fallback deleted)
+2. Strict Date Verification: Verifies that the published date in the table matches today's date
+   in IST (UTC+5:30). If the website still shows yesterday's date, aborts the push and logs
+   'Waiting for market update' error with exit code 2 to prevent database overwrites.
+3. Clean Parsing: Specifically extracts 'Wholesale Rate' for live broiler birds from the table,
+   saving it to Firestore as `wholesale_live_bird`.
 4. Trend Calculation: Fetches yesterday's rate from Firestore, calculates (today - yesterday),
    and stores the difference as an integer in `price_trend`.
-5. Zero-Mistake Failsafe Architecture: Validates all rates within realistic bounds (₹50 - ₹400),
-   preventing corrupt or zero-rate updates.
+5. Zero-Mistake Failsafe: Validates all rates within realistic bounds (₹50 - ₹400).
 """
 
 import os
@@ -30,8 +31,12 @@ from bs4 import BeautifulSoup
 
 if sys.platform == "win32":
     try:
-        sys.stdout.reconfigure(encoding="utf-8")
-        sys.stderr.reconfigure(encoding="utf-8")
+        reconfig_out = getattr(sys.stdout, "reconfigure", None)
+        if callable(reconfig_out):
+            reconfig_out(encoding="utf-8", line_buffering=True)
+        reconfig_err = getattr(sys.stderr, "reconfigure", None)
+        if callable(reconfig_err):
+            reconfig_err(encoding="utf-8", line_buffering=True)
     except Exception:
         pass
 
@@ -42,42 +47,38 @@ IST_TIMEZONE = timezone(timedelta(hours=5, minutes=30))
 MIN_REALISTIC_PRICE = 50.0   # ₹50 per kg minimum
 MAX_REALISTIC_PRICE = 400.0  # ₹400 per kg maximum
 
-# Authoritative Portals Publishing Vencobb & BICC Daily Rate Sheets
+# Authoritative Portals Publishing Active Daily Chicken Rates
+# Note: Root https://chickenratetoday.in/ and poultrysite.in are removed to prevent false stale dates.
 OFFICIAL_SOURCES = [
     {
-        "url": "https://www.poultrybazaar.net/daily-rate-sheet/Broiler-Rates-Hyderabad/",
-        "name": "PoultryBazaar (Hyderabad Vencobb Sheet)",
+        "url": "https://chickenratetoday.in/today-chicken-rate-hyderabad/",
+        "name": "ChickenRateToday (Hyderabad / Telangana Live Table)",
         "state": "TS",
+        "center": "hyderabad",
     },
     {
-        "url": "https://www.poultrybazaar.net/daily-rate-sheet/Broiler-Rates-Telangana/",
-        "name": "PoultryBazaar (Telangana Mandi Sheet)",
-        "state": "TS",
-    },
-    {
-        "url": "https://www.poultrybazaar.net/daily-rate-sheet/Broiler-Rates-Andhra-Pradesh/",
-        "name": "PoultryBazaar (Andhra Pradesh Vencobb Sheet)",
+        "url": "https://chickenratetoday.in/today-chicken-rate-andhra-pradesh/",
+        "name": "ChickenRateToday (Andhra Pradesh Live Table)",
         "state": "AP",
+        "center": "vijayawada",
     },
     {
-        "url": "https://chickenratetoday.in/hyderabad/",
-        "name": "ChickenRateToday (Hyderabad Vencobb Rate)",
-        "state": "TS",
-    },
-    {
-        "url": "https://chickenratetoday.in/",
-        "name": "ChickenRateToday (National & Regional Portal)",
-        "state": "ALL",
-    },
-    {
-        "url": "https://poultrysite.in/today-chicken-rate-hyderabad-telangana/",
-        "name": "PoultrySite (Hyderabad Benchmark)",
-        "state": "TS",
-    },
-    {
-        "url": "https://poultrysite.in/today-chicken-rate-andhra-pradesh/",
-        "name": "PoultrySite (Andhra Pradesh Benchmark)",
+        "url": "https://chickenratetoday.in/today-chicken-rate-vijayawada/",
+        "name": "ChickenRateToday (Vijayawada Live Table)",
         "state": "AP",
+        "center": "vijayawada",
+    },
+    {
+        "url": "https://chickenratetoday.in/chicken-rate-andhra-pradesh/",
+        "name": "ChickenRateToday (Andhra Pradesh Sheet)",
+        "state": "AP",
+        "center": "andhra-pradesh",
+    },
+    {
+        "url": "https://chickenratetoday.in/chicken-rate-telangana/",
+        "name": "ChickenRateToday (Telangana Sheet)",
+        "state": "TS",
+        "center": "telangana",
     },
 ]
 
@@ -210,11 +211,11 @@ def validate_district_rate(rate_dict):
 def parse_price_from_text(text):
     """
     Extracts a numeric float from string containing currency symbols or text.
-    E.g., '₹144/kg' -> 144.0
+    E.g., '₹170/kg' -> 170.0
     """
     if not text:
         return None
-    match = re.search(r"(\d+(?:\.\d+)?)", text.replace(",", ""))
+    match = re.search(r"(\d+(?:\.\d+)?)", str(text).replace(",", ""))
     if match:
         try:
             return float(match.group(1))
@@ -222,21 +223,104 @@ def parse_price_from_text(text):
             return None
     return None
 
-def extract_published_date_from_html(html_content):
+def extract_published_date_from_html(html_content, target_date_ist=None):
     """
-    Scans HTML content for explicit published/effective date strings
-    from official Vencobb/BICC poultry rate portals.
+    Specifically parses HTML tables and elements for explicit published/effective date strings
+    from official chicken rate portals.
+
+    1. Specifically inspects <table> elements:
+       - Header/caption strings (e.g. 'Market Wise September 26, 2026', 'Chicken Rate Today Hyderabad September 26, 2026')
+       - Table rows with a 'Date' column (extracts matching target_date_ist or latest row date).
+    2. Fallback scans standard semantic tags (<time>, <meta>, headings).
     Returns (datetime.date, raw_date_string) or (None, None).
     """
     soup = BeautifulSoup(html_content, "html.parser")
 
-    for tag in soup.find_all(["time", "span", "div", "h1", "h2", "h3", "h4", "p", "th", "td", "meta"]):
-        text = tag.get("content", "") if tag.name == "meta" else tag.get_text(separator=" ", strip=True)
-        if not text or len(text) > 200:
+    # 1. Specifically parse tables for published date
+    tables = soup.find_all("table")
+    for table in tables:
+        # Check table caption or immediately preceding heading
+        prev_heading = table.find_previous(["h1", "h2", "h3", "h4", "caption"])
+        if prev_heading:
+            text = prev_heading.get_text(separator=" ", strip=True)
+            patterns = [
+                r'\b([a-zA-Z]+\s+\d{1,2},?\s+\d{4})\b',
+                r'\b([0-9]{1,2}(?:st|nd|rd|th)?[\s./-]+[a-zA-Z0-9]+[\s./-]+[0-9]{2,4})\b',
+            ]
+            for pat in patterns:
+                m = re.search(pat, text)
+                if m:
+                    raw_date = re.sub(r'(\d+)(st|nd|rd|th)', r'\1', m.group(1).strip())
+                    try:
+                        parsed_dt = date_parser.parse(raw_date, dayfirst=True, fuzzy=True)
+                        if 2020 <= parsed_dt.year <= 2035:
+                            return parsed_dt.date(), raw_date
+                    except Exception:
+                        pass
+
+        rows = table.find_all("tr")
+        if not rows:
             continue
 
+        header_tr = rows[0]
+        headers = [c.get_text(separator=" ", strip=True) for c in header_tr.find_all(["th", "td"])]
+        headers_lower = [h.lower() for h in headers]
+
+        # Check if header row itself contains a date string (e.g. 'Market Wise September 26, 2026')
+        for h in headers:
+            patterns = [
+                r'\b([a-zA-Z]+\s+\d{1,2},?\s+\d{4})\b',
+                r'\b([0-9]{1,2}(?:st|nd|rd|th)?[\s./-]+[a-zA-Z0-9]+[\s./-]+[0-9]{2,4})\b',
+            ]
+            for pat in patterns:
+                m = re.search(pat, h)
+                if m:
+                    raw_date = re.sub(r'(\d+)(st|nd|rd|th)', r'\1', m.group(1).strip())
+                    try:
+                        parsed_dt = date_parser.parse(raw_date, dayfirst=True, fuzzy=True)
+                        if 2020 <= parsed_dt.year <= 2035:
+                            return parsed_dt.date(), raw_date
+                    except Exception:
+                        pass
+
+        # Check for a 'Date' column in the table (e.g. Historical / Daily Rate Table)
+        date_col = None
+        for idx, h in enumerate(headers_lower):
+            if "date" in h:
+                date_col = idx
+                break
+
+        if date_col is not None:
+            latest_table_date = None
+            latest_table_raw = None
+            for r in rows[1:]:
+                cells = [c.get_text(separator=" ", strip=True) for c in r.find_all(["th", "td"])]
+                if len(cells) > date_col:
+                    raw_cell_date = cells[date_col]
+                    raw_clean = re.sub(r'(\d+)(st|nd|rd|th)', r'\1', raw_cell_date.strip())
+                    try:
+                        parsed_dt = date_parser.parse(raw_clean, dayfirst=True, fuzzy=True)
+                        if 2020 <= parsed_dt.year <= 2035:
+                            p_date = parsed_dt.date()
+                            if target_date_ist and p_date == target_date_ist:
+                                return p_date, raw_cell_date
+                            if latest_table_date is None or p_date > latest_table_date:
+                                latest_table_date = p_date
+                                latest_table_raw = raw_cell_date
+                    except Exception:
+                        pass
+            if latest_table_date:
+                return latest_table_date, latest_table_raw
+
+    # 2. Check headings and titles explicitly
+    heading_candidate = None
+    for tag in soup.find_all(["h1", "h2", "h3", "h4", "title"]):
+        text = tag.get_text(separator=" ", strip=True)
+        if not text:
+            continue
         patterns = [
-            r'(?i)(?:date|as on|rates for|updated|effective|market date)[\s:]*([0-9]{1,2}(?:st|nd|rd|th)?[\s./-]+[a-zA-Z0-9]+[\s./-]+[0-9]{2,4})',
+            r'\b([a-zA-Z]+\s+\d{1,2},?\s+\d{4})\b',
+            r'\b([0-9]{1,2}(?:st|nd|rd|th)?[\s./-]+[a-zA-Z0-9]+[\s./-]+[0-9]{2,4})\b',
             r'\b([0-9]{1,2}(?:st|nd|rd|th)?\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+[0-9]{4})\b',
             r'\b([0-9]{1,2}[-/][0-9]{1,2}[-/][0-9]{4})\b',
         ]
@@ -245,18 +329,56 @@ def extract_published_date_from_html(html_content):
             if m:
                 raw_date = re.sub(r'(\d+)(st|nd|rd|th)', r'\1', m.group(1).strip())
                 try:
-                    parsed_dt = date_parser.parse(raw_date, dayfirst=True)
+                    parsed_dt = date_parser.parse(raw_date, dayfirst=True, fuzzy=True)
                     if 2020 <= parsed_dt.year <= 2035:
-                        return parsed_dt.date(), raw_date
+                        p_date = parsed_dt.date()
+                        if target_date_ist and p_date == target_date_ist:
+                            return p_date, raw_date
+                        if heading_candidate is None or p_date > heading_candidate[0]:
+                            heading_candidate = (p_date, raw_date)
                 except Exception:
                     pass
+
+    # 3. General fallback scanning semantic tags (p, span, div, time, th, td - NOT meta tags)
+    general_candidate = None
+    for tag in soup.find_all(["time", "p", "span", "div", "th", "td", "strong", "em"]):
+        text = tag.get_text(separator=" ", strip=True)
+        if not text or len(text) > 200:
+            continue
+
+        patterns = [
+            r'(?i)(?:date|as on|rates for|updated|effective|market date)[\s:]*([0-9]{1,2}(?:st|nd|rd|th)?[\s./-]+[a-zA-Z0-9]+[\s./-]+[0-9]{2,4})',
+            r'\b([0-9]{1,2}(?:st|nd|rd|th)?\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+[0-9]{4})\b',
+            r'\b([0-9]{1,2}[-/][0-9]{1,2}[-/][0-9]{4})\b',
+            r'\b([a-zA-Z]+\s+\d{1,2},?\s+\d{4})\b',
+        ]
+        for pat in patterns:
+            m = re.search(pat, text)
+            if m:
+                raw_date = re.sub(r'(\d+)(st|nd|rd|th)', r'\1', m.group(1).strip())
+                try:
+                    parsed_dt = date_parser.parse(raw_date, dayfirst=True)
+                    if 2020 <= parsed_dt.year <= 2035:
+                        p_date = parsed_dt.date()
+                        if target_date_ist and p_date == target_date_ist:
+                            return p_date, raw_date
+                        if general_candidate is None or p_date > general_candidate[0]:
+                            general_candidate = (p_date, raw_date)
+                except Exception:
+                    pass
+
+    if heading_candidate:
+        return heading_candidate
+
+    if general_candidate:
+        return general_candidate
 
     return None, None
 
 def verify_market_date_against_ist(scraped_dates, target_date_ist):
     """
     Strict Date Verification:
-    Verifies that the published date on the BICC/Vencobb website matches today's date in IST.
+    Verifies that the published date on official website matches today's date in IST.
     If the website has not been updated and still shows yesterday's date (or earlier),
     returns (False, error_message) with 'Waiting for market update' to prevent overwriting
     Firestore with stale data.
@@ -292,36 +414,74 @@ def verify_market_date_against_ist(scraped_dates, target_date_ist):
 
     return True, None
 
-def extract_vencobb_and_mandi_rates_from_html(html_content, source_name=""):
+def extract_vencobb_and_mandi_rates_from_html(html_content, source_name="", default_center=""):
     """
-    Parses HTML tables looking for exact rows (e.g., 'Hyderabad', 'Vijayawada')
-    and exact columns ('Vencobb Paper Rate', 'Mandi Rate', 'Farm Gate', 'Wholesale').
+    Parses HTML tables specifically looking for 'Wholesale Rate' rows and columns,
+    as well as district center mappings (e.g. 'Hyderabad', 'Vijayawada', 'Warangal', 'Vizag').
+    Extracts authoritative Wholesale Live Bird rate (and retail skinless/dressed rates).
     Returns a dict mapping normalized center names to scraped rate data.
     """
     extracted_rates = {}
     soup = BeautifulSoup(html_content, "html.parser")
     tables = soup.find_all("table")
 
+    detected_center = default_center.lower() if default_center else ""
+    if not detected_center:
+        for city in ["hyderabad", "vijayawada", "vizag", "visakhapatnam", "warangal", "guntur", "kurnool", "karimnagar", "nalgonda", "nellore", "kakinada"]:
+            if city in source_name.lower():
+                detected_center = city
+                break
+
     for table in tables:
         rows = table.find_all("tr")
         if not rows:
             continue
 
-        # Look for headers to identify column indices
-        col_mapping = {}
         header_tr = rows[0]
         headers = [th.get_text(separator=" ", strip=True).lower() for th in header_tr.find_all(["th", "td"])]
 
+        col_mapping = {}
         for idx, h in enumerate(headers):
-            if any(term in h for term in ["vencobb", "paper rate", "mandi", "farm gate", "live bird", "wholesale"]):
-                col_mapping["wholesale_live_bird"] = idx
-            elif any(term in h for term in ["dressed", "with skin"]):
+            if any(term in h for term in ["wholesale", "vencobb", "paper rate", "mandi", "farm gate", "live bird", "1 kg chicken- live", "chicken"]):
+                if "wholesale_live_bird" not in col_mapping:
+                    col_mapping["wholesale_live_bird"] = idx
+            if any(term in h for term in ["dressed", "with skin"]):
                 col_mapping["dressed"] = idx
             elif any(term in h for term in ["skinless"]):
                 col_mapping["skinless"] = idx
+            elif any(term in h for term in ["boneless"]):
+                col_mapping["boneless"] = idx
 
         default_rate_col = col_mapping.get("wholesale_live_bird", 1 if len(headers) >= 2 else None)
 
+        # 1. Check for specific 'Wholesale Rate' row (e.g. Market-Wise or Vencobb table)
+        for row in rows:
+            cells = [td.get_text(separator=" ", strip=True) for td in row.find_all(["td", "th"])]
+            if not cells:
+                continue
+
+            first_text = cells[0].strip().lower()
+
+            if "wholesale rate" in first_text or ("wholesale" in first_text and "supermarket" not in first_text):
+                target_col = col_mapping.get("wholesale_live_bird", 1)
+                if len(cells) > target_col:
+                    price = parse_price_from_text(cells[target_col])
+                    if price and MIN_REALISTIC_PRICE <= price <= MAX_REALISTIC_PRICE:
+                        center_key = detected_center if detected_center else "hyderabad"
+                        extracted_rates[center_key] = {
+                            "wholesale_live_bird": price,
+                            "source": source_name,
+                        }
+                        if "skinless" in col_mapping and len(cells) > col_mapping["skinless"]:
+                            s_price = parse_price_from_text(cells[col_mapping["skinless"]])
+                            if s_price and MIN_REALISTIC_PRICE <= s_price <= MAX_REALISTIC_PRICE:
+                                extracted_rates[center_key]["skinlessPrice"] = s_price
+                        if "boneless" in col_mapping and len(cells) > col_mapping["boneless"]:
+                            b_price = parse_price_from_text(cells[col_mapping["boneless"]])
+                            if b_price and MIN_REALISTIC_PRICE <= b_price <= MAX_REALISTIC_PRICE:
+                                extracted_rates[center_key]["bonelessPrice"] = b_price
+
+        # 2. Check for center names in first column (matrix/district sheet format)
         for row in rows[1:]:
             cells = [td.get_text(separator=" ", strip=True) for td in row.find_all(["td", "th"])]
             if not cells:
@@ -333,36 +493,41 @@ def extract_vencobb_and_mandi_rates_from_html(html_content, source_name=""):
             if target_col is not None and len(cells) > target_col:
                 price = parse_price_from_text(cells[target_col])
                 if price and MIN_REALISTIC_PRICE <= price <= MAX_REALISTIC_PRICE:
-                    for key in ["hyderabad", "vijayawada", "vizag", "visakhapatnam", "warangal", "guntur", "kurnool", "karimnagar"]:
+                    for key in ["hyderabad", "vijayawada", "vizag", "visakhapatnam", "warangal", "guntur", "kurnool", "karimnagar", "nalgonda", "nellore", "kakinada"]:
                         if key in center_text:
                             extracted_rates[key] = {
                                 "wholesale_live_bird": price,
                                 "source": source_name,
                             }
+                            if "skinless" in col_mapping and len(cells) > col_mapping["skinless"]:
+                                s_price = parse_price_from_text(cells[col_mapping["skinless"]])
+                                if s_price and MIN_REALISTIC_PRICE <= s_price <= MAX_REALISTIC_PRICE:
+                                    extracted_rates[key]["skinlessPrice"] = s_price
 
-    # Also parse table rows where row label contains 'live' or 'broiler'
-    if "hyderabad" not in extracted_rates:
+    # 3. Fallback: Parse table rows where item label contains 'Live Chicken' or 'Raw Chicken'
+    if detected_center and detected_center not in extracted_rates:
         for tr in soup.find_all("tr"):
-            row_text = tr.get_text(separator=" ", strip=True).lower()
-            if any(k in row_text for k in ["live chicken", "live bird", "farm gate", "vencobb", "mandi"]):
-                cells = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
-                for c in cells[1:]:
-                    val = parse_price_from_text(c)
-                    if val and MIN_REALISTIC_PRICE <= val <= MAX_REALISTIC_PRICE:
-                        extracted_rates["hyderabad"] = {
-                            "wholesale_live_bird": val,
-                            "source": source_name,
-                        }
-                        break
-            if "hyderabad" in extracted_rates:
+            cells = [td.get_text(separator=" ", strip=True) for td in tr.find_all(["td", "th"])]
+            if len(cells) >= 2:
+                row_label = " ".join(cells[:2]).lower()
+                if any(k in row_label for k in ["live chicken", "live bird", "farm gate", "raw chicken", "vencobb"]):
+                    for c in cells[1:]:
+                        val = parse_price_from_text(c)
+                        if val and MIN_REALISTIC_PRICE <= val <= MAX_REALISTIC_PRICE:
+                            extracted_rates[detected_center] = {
+                                "wholesale_live_bird": val,
+                                "source": source_name,
+                            }
+                            break
+            if detected_center in extracted_rates:
                 break
 
     return extracted_rates
 
-def scrape_official_sources():
+def scrape_official_sources(target_date_ist=None):
     """
     Connects to official BICC and Vencobb daily rate sources using requests and BeautifulSoup.
-    Maps exact columns and rows to extract authoritative live rates.
+    Specifically reads tables on active pages for today's published date and extracts the 'Wholesale Rate'.
     Returns (scraped_data, scraped_dates).
     """
     session = requests.Session()
@@ -375,22 +540,23 @@ def scrape_official_sources():
     for src in OFFICIAL_SOURCES:
         url = src["url"]
         name = src["name"]
+        center = src.get("center", "")
         try:
             print(f"   Connecting to {name} ({url})...")
             resp = session.get(url, timeout=12)
             if resp.status_code == 200:
-                # 1. Date extraction for strict market verification
-                pub_date, raw_date_str = extract_published_date_from_html(resp.text)
+                # 1. Date extraction specifically reading tables for market verification
+                pub_date, raw_date_str = extract_published_date_from_html(resp.text, target_date_ist=target_date_ist)
                 if pub_date:
                     scraped_dates[name] = pub_date
                     print(f"   [📅] Source published date detected: {pub_date.strftime('%d-%b-%Y')} ('{raw_date_str}')")
 
-                # 2. Extract live rates
-                extracted = extract_vencobb_and_mandi_rates_from_html(resp.text, source_name=name)
-                for center, data in extracted.items():
-                    if center not in scraped_data:
-                        scraped_data[center] = data
-                        print(f"   [✓] Extracted {center.title()} Vencobb/Mandi Rate: ₹{data['wholesale_live_bird']:.0f}/kg from {name}")
+                # 2. Extract live wholesale rates from the table
+                extracted = extract_vencobb_and_mandi_rates_from_html(resp.text, source_name=name, default_center=center)
+                for c_name, data in extracted.items():
+                    if c_name not in scraped_data:
+                        scraped_data[c_name] = data
+                        print(f"   [✓] Extracted {c_name.title()} Wholesale Rate: ₹{data['wholesale_live_bird']:.0f}/kg from {name}")
             else:
                 print(f"   [!] Note: {name} responded with status {resp.status_code}")
         except Exception as e:
@@ -456,14 +622,24 @@ def generate_daily_district_rates(target_date, scraped_rates=None, db=None):
     3. Calculates price_trend = int(today - yesterday).
     """
     if scraped_rates is None:
-        scraped_rates, _ = scrape_official_sources()
+        target_scrape_date = target_date.date() if isinstance(target_date, datetime) else target_date
+        scraped_rates, _ = scrape_official_sources(target_date_ist=target_scrape_date)
 
     date_str = target_date.strftime("%Y%m%d")
     iso_date = target_date.strftime("%Y-%m-%dT00:00:00.000Z")
     updated_at = datetime.now(timezone.utc).isoformat()
 
-    base_ts_live = scraped_rates.get("hyderabad", {}).get("wholesale_live_bird", 144.0)
-    base_ap_live = scraped_rates.get("vijayawada", {}).get("wholesale_live_bird", 140.0)
+    base_ts_live = (
+        scraped_rates.get("hyderabad", {}).get("wholesale_live_bird")
+        or scraped_rates.get("telangana", {}).get("wholesale_live_bird")
+        or 144.0
+    )
+    base_ap_live = (
+        scraped_rates.get("vijayawada", {}).get("wholesale_live_bird")
+        or scraped_rates.get("andhra-pradesh", {}).get("wholesale_live_bird")
+        or scraped_rates.get("andhra", {}).get("wholesale_live_bird")
+        or 140.0
+    )
 
     # Sanity bounds check
     if base_ts_live < MIN_REALISTIC_PRICE or base_ts_live > MAX_REALISTIC_PRICE:
@@ -494,7 +670,7 @@ def generate_daily_district_rates(target_date, scraped_rates=None, db=None):
         # Fetch yesterday's rate from Firestore
         yesterday_rate = fetch_yesterday_rate_from_firestore(db, d["id"], d["state"], target_date)
         if yesterday_rate is not None:
-            price_trend = int(round(live_bird - yesterday_rate))
+            price_trend = round(live_bird - yesterday_rate)
             prev_rate_for_record = float(yesterday_rate)
         else:
             trend_default = 1 if (i % 3 == 0) else (-2 if (i % 3 == 1) else 0)
@@ -538,7 +714,7 @@ def generate_daily_district_rates(target_date, scraped_rates=None, db=None):
 
         yesterday_rate = fetch_yesterday_rate_from_firestore(db, d["id"], d["state"], target_date)
         if yesterday_rate is not None:
-            price_trend = int(round(live_bird - yesterday_rate))
+            price_trend = round(live_bird - yesterday_rate)
             prev_rate_for_record = float(yesterday_rate)
         else:
             trend_default = -1 if (i % 3 == 0) else (2 if (i % 3 == 1) else 0)
@@ -647,7 +823,7 @@ def main():
     print("==================================================")
 
     # 1. Scrape official data sources
-    scraped_rates, scraped_dates = scrape_official_sources()
+    scraped_rates, scraped_dates = scrape_official_sources(target_date_ist=target_ist_date)
 
     # 2. Strict Date Verification Step
     # Before pushing to Firestore, verify published date matches today's date in IST

@@ -25,32 +25,38 @@ class TestSanityChecks(unittest.TestCase):
     def test_zero_rejected(self):
         is_valid, val, err = validate_price(0, "liveBirdPrice")
         self.assertFalse(is_valid)
-        self.assertIn("zero or negative", err)
+        self.assertIsNotNone(err)
+        self.assertIn("zero or negative", err or "")
 
     def test_negative_rejected(self):
         is_valid, val, err = validate_price(-15.0, "dressedPrice")
         self.assertFalse(is_valid)
-        self.assertIn("zero or negative", err)
+        self.assertIsNotNone(err)
+        self.assertIn("zero or negative", err or "")
 
     def test_null_rejected(self):
         is_valid, val, err = validate_price(None, "liveBirdPrice")
         self.assertFalse(is_valid)
-        self.assertIn("null", err)
+        self.assertIsNotNone(err)
+        self.assertIn("null", err or "")
 
     def test_below_range_rejected(self):
         is_valid, val, err = validate_price(49.99, "liveBirdPrice")
         self.assertFalse(is_valid)
-        self.assertIn("outside realistic range", err)
+        self.assertIsNotNone(err)
+        self.assertIn("outside realistic range", err or "")
 
     def test_above_range_rejected(self):
         is_valid, val, err = validate_price(401.0, "skinlessPrice")
         self.assertFalse(is_valid)
-        self.assertIn("outside realistic range", err)
+        self.assertIsNotNone(err)
+        self.assertIn("outside realistic range", err or "")
 
     def test_non_numeric_rejected(self):
         is_valid, val, err = validate_price("N/A", "liveBirdPrice")
         self.assertFalse(is_valid)
-        self.assertIn("not a valid number", err)
+        self.assertIsNotNone(err)
+        self.assertIn("not a valid number", err or "")
 
     def test_district_rate_validation(self):
         # Good district
@@ -75,6 +81,8 @@ class TestSanityChecks(unittest.TestCase):
         }
         valid, _, err = validate_district_rate(corrupt_zero)
         self.assertFalse(valid)
+        self.assertIsNotNone(err)
+        assert err is not None
         self.assertIn("liveBirdPrice is ₹0.00", err)
 
         # Corrupt district with null skinless price
@@ -87,6 +95,8 @@ class TestSanityChecks(unittest.TestCase):
         }
         valid, _, err = validate_district_rate(corrupt_null)
         self.assertFalse(valid)
+        self.assertIsNotNone(err)
+        assert err is not None
         self.assertIn("skinlessPrice is null", err)
 
     def test_extract_published_date(self):
@@ -110,6 +120,8 @@ class TestSanityChecks(unittest.TestCase):
         }
         is_verified, err = verify_market_date_against_ist(stale_dates, today_ist)
         self.assertFalse(is_verified)
+        self.assertIsNotNone(err)
+        assert err is not None
         self.assertIn("Waiting for market update", err)
 
         # Website updated with today's rates
@@ -119,6 +131,90 @@ class TestSanityChecks(unittest.TestCase):
         is_verified, err = verify_market_date_against_ist(today_dates, today_ist)
         self.assertTrue(is_verified)
         self.assertIsNone(err)
+
+    def test_extract_table_date_from_chickenratetoday(self):
+        from scrape_rates import extract_published_date_from_html
+        from datetime import date
+
+        table_html = """
+        <h2>Chicken Rate Today Hyderabad September 26, 2026</h2>
+        <figure class="wp-block-table">
+          <table>
+            <tbody>
+              <tr><td>Date</td><td>Chicken</td><td>Skinless</td><td>Boneless</td></tr>
+              <tr><td>September 26, 2026</td><td>170</td><td>210</td><td>220</td></tr>
+              <tr><td>September 25, 2026</td><td>170</td><td>210</td><td>220</td></tr>
+            </tbody>
+          </table>
+        </figure>
+        """
+        pub_date, raw_str = extract_published_date_from_html(table_html)
+        self.assertEqual(pub_date, date(2026, 9, 26))
+        self.assertIsNotNone(raw_str)
+        assert raw_str is not None
+        self.assertIn("September 26, 2026", raw_str)
+
+    def test_extract_wholesale_rate_from_table(self):
+        from scrape_rates import extract_vencobb_and_mandi_rates_from_html
+
+        table_html = """
+        <figure class="wp-block-table">
+          <table>
+            <tbody>
+              <tr><td><strong>Market Wise</strong></td><td><strong>1 Kg Chicken- Live</strong></td><td><strong>Skinless</strong></td><td><strong>Boneless</strong></td></tr>
+              <tr><td><strong>1 Kg Rate</strong></td><td>170</td><td>210</td><td>220</td></tr>
+              <tr><td><strong>Wholesale Rate</strong></td><td>170</td><td>210</td><td>220</td></tr>
+              <tr><td><strong>Retail Rate</strong></td><td>190</td><td>230</td><td>250</td></tr>
+            </tbody>
+          </table>
+        </figure>
+        """
+        rates = extract_vencobb_and_mandi_rates_from_html(
+            table_html,
+            source_name="ChickenRateToday (Hyderabad)",
+            default_center="hyderabad"
+        )
+        self.assertIn("hyderabad", rates)
+        self.assertEqual(rates["hyderabad"]["wholesale_live_bird"], 170.0)
+        self.assertEqual(rates["hyderabad"]["skinlessPrice"], 210.0)
+
+    def test_official_sources_active_urls(self):
+        from scrape_rates import OFFICIAL_SOURCES
+
+        urls = [s["url"] for s in OFFICIAL_SOURCES]
+        self.assertIn("https://chickenratetoday.in/today-chicken-rate-hyderabad/", urls)
+        self.assertIn("https://chickenratetoday.in/today-chicken-rate-andhra-pradesh/", urls)
+        self.assertIn("https://chickenratetoday.in/today-chicken-rate-vijayawada/", urls)
+
+        # Confirm broken 404 links and root stale fallback are removed
+        for u in urls:
+            self.assertNotEqual(u, "https://chickenratetoday.in/hyderabad/")
+            self.assertNotEqual(u, "https://chickenratetoday.in/")
+            self.assertFalse("poultrysite.in" in u)
+
+    def test_table_yesterday_date_aborts_push(self):
+        from scrape_rates import extract_published_date_from_html, verify_market_date_against_ist
+        from datetime import date
+
+        table_html = """
+        <figure class="wp-block-table">
+          <table>
+            <tbody>
+              <tr><td>Date</td><td>Chicken</td><td>Skinless</td><td>Boneless</td></tr>
+              <tr><td>September 25, 2026</td><td>170</td><td>210</td><td>220</td></tr>
+            </tbody>
+          </table>
+        </figure>
+        """
+        pub_date, _ = extract_published_date_from_html(table_html)
+        self.assertEqual(pub_date, date(2026, 9, 25))
+
+        today_ist = date(2026, 9, 26)
+        is_verified, err = verify_market_date_against_ist({"ChickenRateToday (Hyderabad)": pub_date}, today_ist)
+        self.assertFalse(is_verified)
+        self.assertIsNotNone(err)
+        assert err is not None
+        self.assertIn("Waiting for market update", err)
 
 if __name__ == "__main__":
     unittest.main()

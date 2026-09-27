@@ -2,8 +2,8 @@ name: Daily Chicken Rates Scraper
 
 on:
   schedule:
-    # 6:00 AM IST (Indian Standard Time = UTC + 5:30) -> 00:30 AM UTC
-    - cron: '30 0 * * *'
+    # 8:30 AM IST (Indian Standard Time = UTC + 5:30) -> 03:00 AM UTC
+    - cron: '0 3 * * *'
   workflow_dispatch: # Allows manual trigger anytime from GitHub Actions tab
 
 jobs:

@@ -1,0 +1,3 @@
+"""
+CW Poultry Scraper package.
+"""
